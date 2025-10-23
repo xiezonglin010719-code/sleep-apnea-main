@@ -1,0 +1,32 @@
+*data
+*_experiments
+*notes
+example.py
+train_model.py
+downloadlinks.txt
+*__pycache__
+utils/__pycache__
+*.idea
+src/__init__.py
+*src/utils/__pycache/
+*visualization
+_experiments/app_v1
+*/app_v1/
+webapp
+app/model
+test
+.env
+# Python 虚拟环境
+venv/
+env/
+.env
+*.pyc
+__pycache__/
+dist/
+build/
+*.egg-info/
+
+# 编辑器配置（可选，如 VS Code）
+.vscode/
+.idea/am
+src/train/models

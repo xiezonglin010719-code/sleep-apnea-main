@@ -1,0 +1,56 @@
+name: "sleep-apnea-dataset-generation"
+version: "1.0.0"
+steps:
+#  - "download"
+  - "extract"
+  - "process"
+
+data:
+  ids:
+    - "00000999"
+  targets:
+    - "Hypopnea"
+    - "ObstructiveApnea"
+    - "normal"  # 新增：补充实际存在的正常类别
+
+download:
+  mode: "local" #local or gcs
+  bucket_name: null
+  edf_urls:
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1e7&path=/V3/APNEA_EDF/00000999-100507/00000999-100507[004].edf&fileName=00000999-100507%5B004%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1e6&path=/V3/APNEA_EDF/00000999-100507/00000999-100507[005].edf&fileName=00000999-100507%5B005%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1e8&path=/V3/APNEA_EDF/00000999-100507/00000999-100507[003].edf&fileName=00000999-100507%5B003%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1e9&path=/V3/APNEA_EDF/00000999-100507/00000999-100507[002].edf&fileName=00000999-100507%5B002%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1ea&path=/V3/APNEA_EDF/00000999-100507/00000999-100507[001].edf&fileName=00000999-100507%5B001%5D.edf"
+  rml_urls:
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842ced8b&path=/V3/APNEA_RML_clean/00000995-100507.rml&fileName=00000995-100507.rml"
+    - "https://download.scidb.cn/download?fileId=6436724b9870236416bbf77f&path=/V2/APNEA_RML_clean/00000999-100507.rml&fileName=00000999-100507.rml"
+  catalog_file: "file_catalog.txt"  # 保持不变
+
+audio:
+  data_channels: "Mic"
+  edf_step_size: 10000000
+  sample_rate: 48000
+  clip_length: 30
+  clip_overlap: 15
+  n_mels: 128
+  ids_to_process:
+    - "00000999"
+  image_size: 224
+
+training:
+  batch_size: 32
+  num_epochs: 20
+  learning_rate: 0.001
+  dropout: 0.3
+  num_classes: 3  # 与 data.targets 数量一致（Hypopnea + ObstructiveApnea）
+  val_split: 0.2
+  test_split: 0.1
+
+paths:
+  root: "data"
+  dataset_file_name: "data"
+  # 新增：音频处理结果保存路径（解决 AttributeError）
+  audio_save_path: "data/processed/audio"  # 相对于 root 的路径
+  # 补充：信号处理结果路径（与训练代码对应）
+  signals_path: "data/processed/signals"  # 生成的 pickle 文件保存路径
