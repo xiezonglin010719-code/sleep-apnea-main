@@ -1,0 +1,105 @@
+project_name: psg_to_sonar_federated
+experiment_id: v1.0
+device: cpu
+random_seed: 42
+
+psg:
+  # 新增Effort ABD专项配置
+  effort_abd:
+    bandpass_cutoffs: [ 0.1, 2.0 ]  # 呼吸努力信号关键频段
+    sampling_rate: 100  # 专用采样率
+
+  event_labels: { "Normal": 0, "Hypopnea": 1, "Obstructive Apnea": 2 }
+  class_names: [ "Normal", "Hypopnea", "Obstructive Apnea" ]
+
+  # 只保留 6 个时序特征通道
+  target_channels:
+    - "EEG"
+    - "EOG"
+    - "EMG"
+    - "ECG"
+    - "Flow Patient"
+    - "Effort ABD"
+    - "Effort THO"
+
+  # 目标采样率（保持前面修正）
+  channel_sampling_rates:
+    "EEG": 200
+    "EOG": 200
+    "EMG": 200
+    "ECG": 200
+    "Flow Patient": 100
+    "Effort ABD": 100
+    "Effort THO": 100
+
+  # 帧化参数（新增）
+  frame_length_s: 0.5      # 每帧 0.5 秒
+  frame_hop_s:    0.25     # 步长 0.25 秒 → 30s 得 120 帧
+  pad_to_frames:  128      # 右侧填充/插值到 128 帧
+  per_frame_features: 6    # 每模态每帧 6 维 → 6 模态 × 6 = 36
+
+  # 段参数仍然 30s、0.5 重叠
+  segment_length: 30
+  segment_overlap: 0.5
+
+  normalize: True
+  bandpass_cutoffs:
+    "EEG": [0.5, 30]
+    "EOG": [0.1, 10]
+    "EMG": [10, 100]
+    "ECG": [0.5, 50]
+    "Flow Patient": [0.1, 2.0]
+    "Effort ABD":   [0.1, 2.0]
+
+
+generator:
+  input_dim: 256
+  output_dim: 128
+  hidden_layers: [512, 256]
+  activation: relu
+  dropout_rate: 0.3
+  generator_type: wgan
+
+federated:
+  global_rounds: 30
+  local_epochs: 10
+  num_clients: 5
+  client_fraction: 0.005
+  aggregation_strategy: fedavg
+  learning_rate: 0.0008
+  batch_size: 16
+  differential_privacy: true
+  dp_epsilon: 8.0
+  dp_delta: 1e-05
+  client_selection: random
+  balanced_sampler: true  # 明确启用均衡采样
+
+paths:
+  root_dir: psg_federated
+  raw_psg_dir: "/Users/liyuxiang/Downloads/sleep-apnea-main/data/preprocess/edf"
+  processed_psg_dir: "/Users/liyuxiang/Downloads/sleep-apnea-main/src/federated/data/preprocess/psg_features"
+  psg_labels_dir: "data/preprocess/label"
+  federated_data_dir: "/Users/liyuxiang/Downloads/sleep-apnea-main/src/federated/data/clients"
+  global_model_dir: "federated/data/global_models"
+  client_models_dir: "federated/data/client_models"
+
+dataset:
+
+  patient_ids: [ "00000995", "00000999", "00001000"，"00001008" ]  # 每个ID用双引号包裹
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  client_data_split: iid
+  non_iid_alpha: 0.5
+
+steps:
+#  - download_psg
+  - preprocess_psg
+  - split_federated
+  - federated_train
+  - evaluate_generator
+
+
+# 新增分类相关配置
+num_classes: 3
+class_names: ["normal", "Hypopnea", "ObstructiveApnea"]  # 根据实际类别调整

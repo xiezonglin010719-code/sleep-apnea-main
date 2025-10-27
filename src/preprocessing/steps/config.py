@@ -54,6 +54,7 @@ class PathsConfig(BaseModel):
     spectrogram_path: str = Field(default=None)
     signals_path: str = Field(default=None)
     retired_path: str = Field(default=None)
+    augmented_save_path: str = Field(default=None)
 
     def _set_paths(self):
         base_path = Path(self.root)
@@ -67,6 +68,7 @@ class PathsConfig(BaseModel):
         self.spectrogram_path = os.path.join(base_path, 'processed', 'spectrogram')
         self.signals_path = os.path.join(base_path, 'processed', 'signals')
         self.retired_path = os.path.join(base_path, 'retired')
+        self.augmented_save_path = os.path.join(base_path, 'processed', 'augmented_signals')
 
     def __init__(self, **data):
         super().__init__(**data)

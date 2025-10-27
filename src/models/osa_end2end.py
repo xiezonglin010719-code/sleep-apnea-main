@@ -19,7 +19,7 @@ class AttentionBlock(nn.Module):
 
 class OSAEnd2EndModel(nn.Module):
     """端到端OSA诊断模型：CNN提取空间特征 + LSTM提取时序特征 + Attention强化关键信息"""
-    def __init__(self, img_channels=1, img_size=224, seq_len=10, num_classes=2):
+    def __init__(self, img_channels=1, img_size=64, seq_len=10, num_classes=2):
         super(OSAEnd2EndModel, self).__init__()
         self.seq_len = seq_len
 
