@@ -1,0 +1,4 @@
+MSE: 1.009266
+Pearson r: -0.0012
+Spectral Sim: 0.7251
+Used Fake Target: True
