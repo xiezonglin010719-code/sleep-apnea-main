@@ -1,79 +1,118 @@
-import csv
+# -*- coding: utf-8 -*-
+"""
+osa_end2end_events_ABC.py
+
+三合一增强版（A/B/C）：
+A) 数据层：支持滑窗步长 (stride) 与谱图增强 (SpecAugment)
+B) 损失层：Class-Balanced Loss（可与 Focal 结合），缓解类别不均衡
+C) 判决层：两阶段层级判决（Abnormal 判定 → Hyp vs OA），验证集自动搜索阈值
+
+并新增：按受试者的交叉验证 (LOSO / KFold)；也可沿用固定 train/val 目录的单折训练。
+
+依赖你的骨干模型：
+    from src.models.osa_end2end import OSAEnd2EndModel
+骨干输出 3 类 logits；不改内部结构。
+
+运行示例：
+1) 单折（沿用 train/val 目录）+ A/B/C 全开：
+   python src/train/osa_end2end_events_ABC.py --train_dir data/processed/signals --val_dir data/processed/val \
+        --epochs 30 --stride_train 5 --stride_val 10 --aug_spec \
+        --use_cbl --cbl_beta 0.9999 --use_focal --focal_gamma 1.5
+
+2) LOSO 交叉验证（data_root 下放全部 pickle；用 subject_id 划折）：
+   python src/train/osa_end2end_events_ABC.py --cv_mode loso --data_root data/processed/all_subjects \
+        --epochs 20 --stride_train 5 --stride_val 10 --aug_spec --use_cbl
+
+3) KFold=5 交叉验证：
+   python src/train/osa_end2end_events_ABC.py --cv_mode kfold --k 5 --data_root data/processed/all_subjects \
+        --epochs 20 --stride_train 5 --stride_val 10 --aug_spec --use_cbl
+
+保存：
+- 每折都会在 save_dir 下保存 best pth，文件名包含折信息
+- 也会打印/保存（可选）最佳阈值 tau_abn/tau_h/tau_oa
+"""
+
 import os
 import argparse
 import pickle
+from collections import Counter, defaultdict
+from pathlib import Path
+import json
+
 import numpy as np
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import f1_score, confusion_matrix, classification_report, accuracy_score
-from pathlib import Path
-from tqdm import tqdm
-from collections import defaultdict, Counter
-
-# 导入模型和工具函数
-from src.models.wgan_gp import WGANGP
-from src.models.osa_end2end import OSAEnd2EndModel
-from src.preprocessing.steps.config import load_config
-from src.utils.utils import load_pickle_events, to_uint8_image
-
 import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+from sklearn.model_selection import KFold
+from tqdm import tqdm
 
-# -------------------------
-# 全局配置（统一标签和严重度定义）
-# -------------------------
-# 三类事件标签（与数据中的标签严格对应）
-EVENT_CLASS_NAMES = ["normal", "Hypopnea", "ObstructiveApnea"]
-EVENT_LABEL_MAP = {
+# 你的模型骨干
+from src.models.osa_end2end import OSAEnd2EndModel
+
+EVENT_CLASS_NAMES = ["Normal", "Hypopnea", "ObstructiveApnea"]
+RAW2TRAIN = {
+    # Normal
     "normal": 0, "none": 0, "background": 0, "noevent": 0, "negative": 0,
+    # Hypopnea
     "hypopnea": 1, "hypopnoea": 1,
-    "obstructiveapnea": 2, "obstructive apnea": 2, "oa": 2
+    # Obstructive / Mixed -> OA
+    "obstructive apnea": 2, "obstructiveapnea": 2, "oa": 2,
+    "mixed apnea": 2, "mixedapnea": 2, "ma": 2,
 }
-
-# 严重度定义（4类）
-SEVERITY_BINS = [(0, 5), (5, 15), (15, 30), (30, float("inf"))]
-SEVERITY_NAMES = ["None", "Mild", "Moderate", "Severe"]
-SEVERITY_LABELS = [0, 1, 2, 3]
-
+IGNORE_SET = {"central apnea", "centralapnea", "ca"}
 
 # -------------------------
-# 工具函数
+# 工具
 # -------------------------
-def load_truth_csv(csv_path):
-    """
-    读取 psg_audio_ahi_severity_from_config.py 生成的 CSV
-    返回: {subject_id: {"ahi": float, "severity": int, "severity_name": str}}
-    """
-    truth = {}
-    with open(csv_path, "r", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            sid = row["subject_id"].strip()
-            ahi = float(row["true_ahi"])
-            sev = int(row["true_severity"])
-            sev_name = row.get("severity_name", SEVERITY_NAMES[sev])
-            truth[sid] = {"ahi": ahi, "severity": sev, "severity_name": sev_name}
-    return truth
 
+# ---------- 时间单位工具 ----------
+def to_seconds(x, unit="sec", fs=None, hop_len=None):
+    """
+    把时间 x 转成秒：
+      - unit='sec'：x 已是秒
+      - unit='sample'：x 是样本点，需要 fs
+      - unit='frame'：x 是帧索引，需要 hop_len（每帧样本数）和 fs
+    """
+    if unit == "sec":
+        return float(x)
+    elif unit == "sample":
+        assert fs and fs > 0, "unit=sample 需要提供 fs"
+        return float(x) / float(fs)
+    elif unit == "frame":
+        assert hop_len and fs and fs > 0, "unit=frame 需要 hop_len 与 fs"
+        return float(x) * float(hop_len) / float(fs)
+    else:
+        raise ValueError(f"未知时间单位: {unit}")
 
-def cfg_get(cfg, path, default=None):
-    cur = cfg
-    for key in path.split('.'):
-        if cur is None:
-            return default
-        if hasattr(cur, key):
-            cur = getattr(cur, key)
-            continue
-        if isinstance(cur, dict) and key in cur:
-            cur = cur[key]
-            continue
-        return default
-    return cur
+def segment_label_from_events(seg_start, seg_end, events, overlap_thresh=0.2):
+    """
+    seg_start/seg_end 已是“秒”，events 里只统计 Hypopnea/OA 的时间重叠。
+    返回三分类标签：0=Normal, 1=Hypopnea, 2=ObstructiveApnea
+    """
+    dur = max(1e-6, seg_end - seg_start)
+    dur_h, dur_o = 0.0, 0.0
+
+    for lab, ev_s, ev_e in events:  # lab: 0/1/2，仅传入窗口内事件即可
+        s = max(seg_start, ev_s)
+        t = min(seg_end,   ev_e)
+        inter = max(0.0, t - s)
+        if lab == 1:
+            dur_h += inter
+        elif lab == 2:
+            dur_o += inter
+
+    frac_h = min(1.0, max(0.0, dur_h / dur))
+    frac_o = min(1.0, max(0.0, dur_o / dur))
+    if max(frac_h, frac_o) >= overlap_thresh:
+        return 1 if frac_h >= frac_o else 2, frac_h, frac_o
+    return 0, frac_h, frac_o
+
 
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
-
 
 def resolve_dir(p, anchors):
     if p is None:
@@ -87,1059 +126,828 @@ def resolve_dir(p, anchors):
             return str(cand.resolve())
     return str((anchors[0] / P).resolve())
 
+def load_pickle_events(pickle_path):
+    with open(pickle_path, "rb") as f:
+        return pickle.load(f)
 
-def classify_severity(ahi: float) -> int:
-    """根据AHI值分类严重度（确保正常样本映射到0类）"""
-    if ahi < SEVERITY_BINS[0][1]:  # AHI <5 → None（正常）
-        return 0
-    for i, (lo, hi) in enumerate(SEVERITY_BINS[1:], 1):
-        if lo <= ahi < hi:
-            return i
-    return len(SEVERITY_BINS) - 1
 
+def to_float_image(sig, force_hw=None):
+    import torch as _t, numpy as _n
+    x = _n.asarray(sig, _n.float32); x = _n.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    if force_hw is not None and x.shape != tuple(force_hw):
+        ten = _t.from_numpy(x)[None, None, ...]
+        ten = F.interpolate(ten, size=force_hw, mode="bilinear", align_corners=False)
+        x = ten.squeeze().numpy().astype(_n.float32)
+    return x
+
+class SingleSubjectSeq(Dataset):
+    def __init__(self, val_dir, sid, img_size=64, seq_len=10):
+        import pickle, os, numpy as np
+        self.samples = []
+        path = os.path.join(val_dir, f"{sid}.pickle")
+        events = pickle.load(open(path, "rb"))
+        imgs = []
+        for ev in events:
+            lab_raw = str(getattr(ev, "label", "none")).lower().strip()
+            if lab_raw in IGNORE_SET: continue
+            if lab_raw not in RAW2TRAIN: continue
+            sig = getattr(ev, "signal", None)
+            if sig is None: continue
+            imgs.append(to_float_image(sig, force_hw=(img_size, img_size)))
+        arr = np.stack(imgs, 0)
+        mu, std = float(arr.mean()), float(arr.std()); std = std if std >= 1e-6 else 1e-3
+        for i in range(0, len(imgs) - seq_len + 1):
+            frames = []
+            for j in range(seq_len):
+                x = (imgs[i+j] - mu) / std; x = np.clip(x, -5.0, 5.0)
+                frames.append(torch.from_numpy(x).float().unsqueeze(0))
+            self.samples.append(torch.stack(frames, dim=0))
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx): return self.samples[idx]
+
+def ema_smooth(probs, alpha=0.6):
+    if len(probs)==0: return probs
+    out = np.zeros_like(probs); out[0] = probs[0]
+    for i in range(1, len(probs)):
+        out[i] = alpha * out[i-1] + (1 - alpha) * probs[i]
+    return out
 
 # -------------------------
-# 端到端数据集定义（修复标签映射和数据加载）
+# A) Dataset：stride + SpecAugment
 # -------------------------
-class OSAEnd2EndDataset(Dataset):
-    """端到端OSA诊断数据集：修复标签匹配和数据统计"""
+def spec_augment_torch(img_t: torch.Tensor,
+                       time_mask_pct=0.1,
+                       freq_mask_pct=0.1,
+                       noise_std=0.01,
+                       gain_db_range=(-2.0, 2.0)):
+    """
+    img_t: (1, H, W) or (T,1,H,W) 单帧增强时传 (1,H,W)
+    简化版 SpecAugment：time/freq mask + 轻微高斯噪声 + 增益
+    """
+    x = img_t.clone()
+    if x.dim() == 3:
+        # (1,H,W)
+        _, H, W = x.shape
+        # 增益
+        g = 10 ** (np.random.uniform(*gain_db_range) / 20.0)
+        x = x * float(g)
+        # 噪声
+        if noise_std > 0:
+            x = x + torch.randn_like(x) * noise_std
+        # time mask（沿 W 方向）
+        tw = max(1, int(W * time_mask_pct))
+        t0 = np.random.randint(0, max(1, W - tw + 1))
+        x[:, :, t0:t0+tw] = 0.0
+        # freq mask（沿 H 方向）
+        fh = max(1, int(H * freq_mask_pct))
+        f0 = np.random.randint(0, max(1, H - fh + 1))
+        x[:, f0:f0+fh, :] = 0.0
+        return x
+    elif x.dim() == 4:
+        # (T,1,H,W)：对每帧做轻量增强
+        out = []
+        for t in range(x.size(0)):
+            out.append(spec_augment_torch(x[t], time_mask_pct, freq_mask_pct, noise_std, gain_db_range))
+        return torch.stack(out, dim=0)
+    else:
+        return x
 
-    def __init__(self, data_dirs, seq_len=10, img_size=64, mean=None, std=None, train=True, wgan=None,
-                 augment_ratio=0.3):
-        self.seq_len = seq_len
-        self.img_size = img_size
-        self.train = train
-        self.wgan = wgan
-        self.augment_ratio = augment_ratio
-        self.mean = mean
-        self.std = std
-        self.label_map = EVENT_LABEL_MAP  # 统一使用全局标签映射
+class EventSeqDataset(Dataset):
+    """
+    省内存版事件序列数据集：
+    - 仅保存 (sid, start_idx) 索引；getitem 时按需取 [start : start+seq_len] 片段
+    - 支持 stride、SpecAugment、按受试者 z-score
+    - 窗口标签用“事件时间重叠率”判定：
+        * 三分类：max(frac_h, frac_oa) >= overlap_thresh 时，取较大者（1=Hyp, 2=OA），否则 0=Normal
+        * 二分类(binary_abnormal)：(frac_h+frac_oa) >= overlap_thresh → 1（异常），否则 0（正常）
+    - 时间单位可配置：sec / sample / frame（需要 fs/hop_len）
+    需要外部提供：
+        - load_pickle_events(pickle_path)      # 返回事件列表
+        - to_float_image(sig, force_hw=(H, W)) # 把二维信号转为 float32 图像
+    事件对象 / 记录需要至少包含：.label / .signal / .start / .end
+    """
 
-        self.data = self._load_and_process_data(data_dirs)
-        self.labels = [label for _, _, label in self.data]  # 新增这一行
+    def __init__(self,
+                 data_dir: str,
+                 img_size: int = 64,
+                 seq_len: int = 10,
+                 train: bool = True,
+                 debug_probe: bool = False,
+                 stride: int = 1,
+                 aug_spec: bool = False,
+                 max_windows_per_subject: int = None,
+                 overlap_thresh: float = 0.2,
+                 three_class: bool = True,
+                 # 时间单位设置
+                 time_unit: str = "sec",  # 'sec' | 'sample' | 'frame'
+                 fs: float = None,        # 采样率（当 unit 为 sample/frame 时需要）
+                 hop_len: int = None      # 每帧样本数（当 unit 为 frame 时需要）
+                 ):
+        super().__init__()
 
-        self._print_label_distribution()
+        self.data_dir = data_dir
+        self.img_size = int(img_size)
+        self.seq_len = int(seq_len)
+        self.train = bool(train)
+        self.debug_probe = bool(debug_probe)
+        self.stride = max(1, int(stride))
+        self.aug_spec = bool(aug_spec) and self.train
+        self.max_windows_per_subject = max_windows_per_subject
 
-        # 计算标准化参数（仅训练集）
-        if train and self.mean is None:
-            self.mean, self.std = self._calculate_mean_std()
+        self.overlap_thresh = float(overlap_thresh)
+        self.three_class = bool(three_class)
 
-    def _load_and_process_data(self, data_dirs):
-        """加载多个目录的数据，修复标签匹配逻辑"""
-        subject_events = defaultdict(list)  # {subject_id: list of (img, label)}
-        all_labels = []  # 统计所有标签，用于调试
+        self.time_unit = str(time_unit).lower()
+        self.fs = fs
+        self.hop_len = hop_len
 
-        for data_dir in data_dirs:
-            if not os.path.exists(data_dir):
-                print(f"警告：目录不存在，跳过 - {data_dir}")
+        # 数据缓存
+        # sid -> list of (img(np.float32 HxW), cls:int, start_sec:float, end_sec:float)
+        self.events_by_subject: dict[str, list[tuple]] = {}
+        # sid -> (mu, std) 供 z-score
+        self.subj_stats: dict[str, tuple[float, float]] = {}
+        # 索引表：[(sid, start_idx), ...]
+        self.index: list[tuple[str, int]] = []
+        self.index2sid: list[str] = []  # 调试用
+
+        self._scan_subjects()
+        self._build_index()
+
+        if self.debug_probe:
+            # 用 per-event 标签粗略统计分布（不展开窗口）
+            from collections import Counter
+            cnt = Counter()
+            for sid, evs in self.events_by_subject.items():
+                for _, y, _, _ in evs:
+                    cnt[y] += 1
+            print(f"[Dataset] 事件级标签分布近似：{dict(cnt)} (0=Normal,1=Hypopnea,2=OA)")
+            print(f"[Index] 窗口数：{len(self.index)} (seq_len={self.seq_len}, stride={self.stride})")
+
+    # -------------------------
+    # 工具：时间单位转换/重叠/增强
+    # -------------------------
+    @staticmethod
+    def _to_seconds(x, unit="sec", fs=None, hop_len=None) -> float:
+        """把时间 x 转换为秒。"""
+        if unit == "sec":
+            return float(x)
+        elif unit == "sample":
+            assert fs and fs > 0, "unit=sample 需要提供 fs"
+            return float(x) / float(fs)
+        elif unit == "frame":
+            assert hop_len and fs and fs > 0, "unit=frame 需要 hop_len 与 fs"
+            return float(x) * float(hop_len) / float(fs)
+        else:
+            raise ValueError(f"未知时间单位: {unit}")
+
+    @staticmethod
+    def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+        """区间重叠长度（秒）。"""
+        return max(0.0, min(a1, b1) - max(a0, b0))
+
+    def _spec_augment(self, x: torch.Tensor) -> torch.Tensor:
+        """简化版 SpecAugment：随机时间/频率遮罩 + 随机增益。x:(H,W)"""
+        H, W = x.shape
+        if np.random.rand() < 0.5:
+            w = np.random.randint(1, max(2, W // 12))
+            st = np.random.randint(0, max(1, W - w))
+            x[:, st:st + w] = 0
+        if np.random.rand() < 0.5:
+            h = np.random.randint(1, max(2, H // 12))
+            st = np.random.randint(0, max(1, H - h))
+            x[st:st + h, :] = 0
+        if np.random.rand() < 0.5:
+            x.mul_(0.9 + 0.2 * np.random.rand())
+        return x
+
+    # -------------------------
+    # 数据扫描与索引构建
+    # -------------------------
+    def _scan_subjects(self):
+        if not os.path.exists(self.data_dir):
+            raise FileNotFoundError(f"数据目录不存在：{self.data_dir}")
+
+        pkl_files = sorted([fn for fn in os.listdir(self.data_dir) if fn.endswith(".pickle")])
+        print(f"[Scan] 目录：{self.data_dir} | .pickle 文件数：{len(pkl_files)}")
+
+        for fn in pkl_files:
+            sid = os.path.splitext(fn)[0]
+            pkl = os.path.join(self.data_dir, fn)
+            try:
+                events = load_pickle_events(pkl)
+            except Exception as e:
+                print(f"[warn] 读取失败：{pkl} → {e}")
                 continue
 
-            for filename in os.listdir(data_dir):
-                if filename.endswith(".pickle"):
-                    pickle_path = os.path.join(data_dir, filename)
-                    events = load_pickle_events(pickle_path)
-                    subject_id = filename.split('.')[0]
+            items = []
+            imgs_tmp, labels_tmp = [], []
 
-                    # 区分增强样本
-                    if "aug_" in filename:
-                        subject_id = f"aug_{subject_id}"
+            for ev in events:
+                lab_raw = str(getattr(ev, "label", "none")).lower().strip()
+                if lab_raw in IGNORE_SET:
+                    continue
+                if lab_raw not in RAW2TRAIN:
+                    continue
+                cls = RAW2TRAIN[lab_raw]
 
-                    # 提取事件特征和标签（严格匹配小写）
-                    for ev in events:
-                        img = to_uint8_image(ev.signal)
-                        event_label = str(ev.label).lower().strip()  # 强制小写+去空格
-                        mapped = EVENT_LABEL_MAP.get(event_label)
-                        if mapped is None:
-                            print(f"[skip] 未识别标签: {event_label}")
-                            continue
+                sig = getattr(ev, "signal", None)
+                if sig is None or np.asarray(sig).ndim != 2:
+                    continue
 
-                        # 标签映射（兼容更多可能的标签写法）
-                        if event_label in self.label_map:
-                            mapped_label = self.label_map[event_label]
-                        elif event_label == "obstructive apnea":
-                            mapped_label = self.label_map["obstructiveapnea"]  # 兼容带空格的标签
-                        elif event_label == "hypopnoea":
-                            mapped_label = self.label_map["hypopnea"]  # 兼容英式拼写
-                        else:
-                            print(f"警告：无效标签 '{event_label}'，跳过事件（{subject_id}）")
-                            continue
+                # 时间统一为秒
+                s_raw = float(getattr(ev, "start", 0.0))
+                e_raw = float(getattr(ev, "end", s_raw))
+                s_sec = self._to_seconds(s_raw, unit=self.time_unit, fs=self.fs, hop_len=self.hop_len)
+                e_sec = self._to_seconds(e_raw, unit=self.time_unit, fs=self.fs, hop_len=self.hop_len)
+                if e_sec <= s_sec:
+                    e_sec = s_sec + 1e-3  # 防御性修正
 
-                        subject_events[subject_id].append((img, mapped_label))
-                        all_labels.append(mapped_label)
+                img = to_float_image(sig, force_hw=(self.img_size, self.img_size))  # np.float32(H,W)
+                items.append((img, cls, s_sec, e_sec))
+                imgs_tmp.append(img)
+                labels_tmp.append(cls)
 
-        # 生成时序序列
-        seq_data = []
-        for subj_id, events in subject_events.items():
-            if len(events) >= self.seq_len:
-                for i in range(len(events) - self.seq_len + 1):
-                    window_imgs = [img for img, _ in events[i:i + self.seq_len]]
-                    window_label = events[i + self.seq_len - 1][1]  # 用最后一个事件的标签
-                    seq_data.append((subj_id, window_imgs, window_label))
+            if not items:
+                print(f"[Scan] {fn}: 可用事件=0（可能全为 CA 或无效）")
+                continue
 
-        # 打印标签统计
-        print(f"数据加载完成：{len(seq_data)} 条序列 (seq_len={self.seq_len})")
-        print(f"所有事件标签分布：{Counter(all_labels)}（0=normal,1=Hypopnea,2=ObstructiveApnea）")
-        return seq_data
+            arr = np.stack(imgs_tmp, 0)
+            mu, std = float(arr.mean()), float(arr.std())
+            if not np.isfinite(std) or std < 1e-6:
+                std = 1e-3
 
-    def _print_label_distribution(self):
-        """打印数据集的标签分布（用于调试）"""
-        if not self.data:
-            print("警告：数据集中无有效样本")
-            return
-        labels = [label for _, _, label in self.data]
-        label_count = Counter(labels)
-        print(f"序列标签分布：{dict(label_count)}")
-        for idx, name in enumerate(EVENT_CLASS_NAMES):
-            print(f"  {name}: {label_count.get(idx, 0)} 条序列")
+            self.subj_stats[sid] = (mu, std)
+            self.events_by_subject[sid] = items
 
-    def _calculate_mean_std(self, max_samples=5000):
-        """计算标准化参数"""
-        count = 0
-        mean = 0.0
-        M2 = 0.0
-        for _, seq, _ in self.data[:max_samples]:
-            for img in seq:
-                x = img.astype(np.float32) / 255.0
-                n = x.size
-                batch_mean = float(x.mean())
-                batch_var = float(x.var())
-                total = count + n
-                delta = batch_mean - mean
-                mean += delta * n / total
-                M2 += batch_var * n + delta * delta * count * n / total
-                count = total
-        std = float(np.sqrt(M2 / max(count - 1, 1)))
-        print(f"标准化参数 - 均值: {mean:.4f}, 标准差: {std:.4f}")
-        return mean, std
+            from collections import Counter
+            cnt = Counter(labels_tmp)
+            print(f"[Scan] {fn}: 事件数={len(items)} | μ={mu:.4f} σ={std:.4f} | 分布={dict(cnt)}")
 
+            # 释放中间数组
+            del arr, imgs_tmp, labels_tmp
+
+    def _build_index(self):
+        """生成 (sid, start_idx) 索引，不复制图像数据."""
+        for sid, lst in self.events_by_subject.items():
+            L = len(lst)
+            if L < self.seq_len:
+                continue
+
+            starts = list(range(0, L - self.seq_len + 1, self.stride))
+            if self.train and self.max_windows_per_subject is not None and len(starts) > self.max_windows_per_subject:
+                rng = np.random.default_rng()
+                starts = rng.choice(starts, size=self.max_windows_per_subject, replace=False).tolist()
+
+            for st in starts:
+                self.index.append((sid, st))
+                self.index2sid.append(sid)
+
+        print(f"[MakeSeq] 生成序列索引：{len(self.index)} 条 (seq_len={self.seq_len}, stride={self.stride}) | subjects={len(self.events_by_subject)}")
+
+    # -------------------------
+    # PyTorch Dataset 接口
+    # -------------------------
     def __len__(self):
-        return len(self.data)
+        return len(self.index)
 
     def __getitem__(self, idx):
-        subj_id, seq, label = self.data[idx]
-        seq_tensor = []
-        for img in seq:
-            img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # (1,H,W)
-            # 统一尺寸
-            if img_tensor.shape[-2:] != (self.img_size, self.img_size):
-                img_tensor = F.interpolate(
-                    img_tensor.unsqueeze(0),
-                    size=(self.img_size, self.img_size),
-                    mode="bilinear",
-                    align_corners=False
-                ).squeeze(0)
-            img_tensor = img_tensor / 255.0
-            img_tensor = (img_tensor - self.mean) / (self.std + 1e-6)
-            seq_tensor.append(img_tensor)
-        seq_tensor = torch.stack(seq_tensor, dim=0)  # (seq_len, 1, img_size, img_size)
-        return seq_tensor, torch.tensor(label, dtype=torch.long), subj_id
+        sid, st = self.index[idx]
+        mu, std = self.subj_stats.get(sid, (0.0, 1.0))
+        evs = self.events_by_subject[sid]  # list of (img, cls, s_sec, e_sec)
 
+        seq_frames = []
 
-# -------------------------
-# 夜级评估函数（修复严重度映射和样本统计）
-# -------------------------
-@torch.no_grad()
-def eval_night_level_with_truth(model,
-                                dataloader,
-                                device,
-                                truth_csv_path,
-                                epoch_seconds=30,
-                                hyp_idx=1,
-                                osa_idx=2):
-    truth = load_truth_csv(truth_csv_path)
-    print(f"\n加载真值数据：{len(truth)} 个subject")
+        # 1) 构建窗口帧并确定窗口时间范围（秒）
+        seg_start = min(evs[k][2] for k in range(st, st + self.seq_len))
+        seg_end   = max(evs[k][3] for k in range(st, st + self.seq_len))
+        total_dur = max(1e-6, seg_end - seg_start)
 
-    per_subj_preds = defaultdict(list)
-    for batch in dataloader:
-        if len(batch) == 3:
-            seq, _, subj_ids = batch
-        else:
-            raise RuntimeError("期望 dataloader 返回 (seq, label, subj_id) 三元组")
+        # 2) 统计窗口内 Hyp/OA 的时间重叠（只对窗口覆盖的这些事件统计即可）
+        dur_hyp, dur_oa = 0.0, 0.0
 
-        seq = seq.to(device)
-        logits = model(seq)
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
+        for k in range(st, st + self.seq_len):
+            img_np, lab, ev_s, ev_e = evs[k]
 
-        for sid, p in zip(subj_ids, preds):
-            sid = str(sid).strip()
-            per_subj_preds[sid].append(int(p))
+            # z-score & 裁剪 & 可选增强
+            x = (img_np - mu) / std
+            x = np.clip(x, -5.0, 5.0)
+            ten = torch.from_numpy(x).float()  # (H, W)
+            if self.aug_spec:
+                ten = self._spec_augment(ten)
+            ten = ten.unsqueeze(0)  # (1, H, W)
+            seq_frames.append(ten)
 
-    print(f"预测完成：{len(per_subj_preds)} 个subject")
+            inter = self._overlap(seg_start, seg_end, ev_s, ev_e)
+            if lab == 1:
+                dur_hyp += inter
+            elif lab == 2:
+                dur_oa += inter
 
-    y_true_sev, y_pred_sev, used_ids, skipped_sids = [], [], [], []
-    for sid, pred_seq in per_subj_preds.items():
-        # 简化ID匹配，避免正常样本因ID问题被跳过
-        original_sid = sid.replace("aug_", "").replace("_", "").replace("-", "")
-        possible_sids = [sid, original_sid, original_sid.lower(), original_sid.upper()]
-
-        matched_sid = None
-        for candidate in possible_sids:
-            if candidate in truth:
-                matched_sid = candidate
-                break
-
-        if matched_sid is None:
-            skipped_sids.append(sid)
-            continue
-
-        true_info = truth[matched_sid]
-        true_sev = true_info["severity"]
-
-        # 关键改动：增加异常事件判定阈值（连续2个窗口预测为异常才计数）
-        pred_events = 0
-        consecutive = 0
-        threshold = 1  # 连续2个窗口异常才视为有效事件
-        for p in pred_seq:
-            if p in (hyp_idx, osa_idx):
-                consecutive += 1
-                if consecutive >= threshold:
-                    pred_events += 1
-                    consecutive = 0  # 计数后重置，避免重复统计
+        # 3) 重叠率→窗口标签
+        frac_h = min(1.0, max(0.0, dur_hyp / total_dur))
+        frac_o = min(1.0, max(0.0, dur_oa  / total_dur))
+        if self.three_class:
+            if max(frac_h, frac_o) >= self.overlap_thresh:
+                label = 1 if frac_h >= frac_o else 2
             else:
-                consecutive = 0
+                label = 0
+        else:
+            abn_frac = frac_h + frac_o
+            label = 1 if abn_frac >= self.overlap_thresh else 0
 
-        hours = len(pred_seq) * epoch_seconds / 3600.0
-        pred_ahi = pred_events / hours if hours > 0 else 0.0
-        pred_sev = classify_severity(pred_ahi)
+        seq_tensor = torch.stack(seq_frames, dim=0)  # (T, 1, H, W)
 
-        y_true_sev.append(true_sev)
-        y_pred_sev.append(pred_sev)
-        used_ids.append(sid)
+        if self.debug_probe and idx < 2:
+            xx = seq_tensor
+            print(f"[DBG] sample#{idx}@{sid}: min={float(xx.min()):.3f}, max={float(xx.max()):.3f}, var={float(xx.var()):.6f}")
+            print(f"[DBG] seg=({seg_start:.2f},{seg_end:.2f}) dur={total_dur:.2f} | frac_h={frac_h:.3f} frac_o={frac_o:.3f} -> y={label}")
 
-    if not y_true_sev:
-        raise RuntimeError("没有可用的subject进行夜级评估（检查subj_id匹配）")
+        return seq_tensor, torch.tensor(label, dtype=torch.long), sid
 
-    # 打印详细统计
-    print(f"\n有效评估样本数：{len(used_ids)}")
-    print(f"真值严重度分布：{Counter(y_true_sev)}（0=None,1=Mild,2=Moderate,3=Severe）")
-    print(f"预测严重度分布：{Counter(y_pred_sev)}")
 
-    # 计算指标
-    acc = accuracy_score(y_true_sev, y_pred_sev)
-    f1w = f1_score(y_true_sev, y_pred_sev, labels=SEVERITY_LABELS, average="weighted", zero_division=0)
-    cm = confusion_matrix(y_true_sev, y_pred_sev, labels=SEVERITY_LABELS)
-
-    # 输出结果
-    print("\n====== 夜级 OSA 严重程度评估（None/Mild/Moderate/Severe）======")
-    print(f"Subjects used: {len(used_ids)}")
-    print(f"Accuracy: {acc:.4f} | Weighted F1: {f1w:.4f}")
-    print("Confusion Matrix (rows=true, cols=pred):")
-    print(cm)
-    print("\nClassification Report:")
-    print(classification_report(
-        y_true_sev, y_pred_sev,
-        labels=SEVERITY_LABELS,
-        target_names=SEVERITY_NAMES,
-        zero_division=0
-    ))
-    return acc, f1w, cm, (y_true_sev, y_pred_sev, used_ids)
 
 
 # -------------------------
-# 混淆矩阵输出函数
+# B) Class-Balanced Loss（可与 Focal 叠加）
 # -------------------------
-def print_confusion_matrix(y_true, y_pred, class_names, title):
-    cm = confusion_matrix(y_true, y_pred)
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+class ClassBalancedLoss(nn.Module):
+    """
+    Cui et al., "Class-Balanced Loss Based on Effective Number of Samples"
+    支持与 Focal 组合：loss = CB_weight * Focal(CE)
+    """
+    def __init__(self, samples_per_class, beta=0.9999, gamma=0.0, reduction='mean'):
+        super().__init__()
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.reduction = reduction
 
-    print(f"\n{'=' * 50}")
-    print(f"{title} - 混淆矩阵")
-    print(f"{'=' * 50}")
-    print("类别映射：")
-    for idx, name in enumerate(class_names):
-        print(f"  索引 {idx} -> {name}")
-    print(f"\n原始混淆矩阵：")
-    print(cm)
-    print(f"\n归一化混淆矩阵（保留2位小数）：")
-    print(np.round(cm_normalized, 2))
-    print(f"{'=' * 50}\n")
+        effective_num = 1.0 - np.power(self.beta, np.asarray(samples_per_class, np.float64))
+        weights = (1.0 - self.beta) / np.maximum(effective_num, 1e-8)
+        weights = weights / np.sum(weights) * len(samples_per_class)
+        self.weight = torch.tensor(weights, dtype=torch.float32)  # on CPU; move in forward
 
+    def forward(self, logits, targets):
+        # CE per-sample
+        ce = F.cross_entropy(logits, targets, weight=self.weight.to(logits.device), reduction='none')
+        if self.gamma > 0:
+            pt = torch.exp(-ce)
+            loss = (1 - pt) ** self.gamma * ce
+        else:
+            loss = ce
+        if self.reduction == 'mean':
+            return loss.mean()
+        return loss
 
 # -------------------------
-# 训练和评估函数
+# 训练与评估（含 C：层级判决与阈值搜索）
 # -------------------------
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, probe=False):
+    from sklearn.metrics import confusion_matrix, f1_score
+
     model.train()
-    total_loss, all_preds, all_labels = 0.0, [], []
-    for batch in tqdm(dataloader, desc="训练"):
-        if isinstance(batch, (list, tuple)) and len(batch) == 3:
-            seq, labels, _ = batch
-        else:
-            seq, labels = batch
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    total_loss = 0.0
+    all_p, all_y = [], []
+    did_probe = not probe
 
-        seq = seq.to(device)
-        labels = labels.view(-1).to(device)
+    for seq, y, _ in tqdm(loader, desc="训练(事件)"):
+        seq = seq.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-        optimizer.zero_grad()
-        outputs = model(seq)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            out = model(seq)  # (B,C)  这里 C=3（Normal/Hyp/OA）
+            # === 层级式损失：异常(非0) 的 BCE + 原分类损失 ===
+            abn_target = (y != 0).long()
+            p = F.softmax(out, dim=1)
+            p_abn = (1.0 - p[:, 0]).clamp(1e-6, 1-1e-6)
+            loss_abn = F.binary_cross_entropy(p_abn.unsqueeze(1), abn_target.float().unsqueeze(1))
+            loss = criterion(out, y) + 0.5 * loss_abn
 
-        total_loss += loss.item() * seq.size(0)
-        preds = torch.argmax(outputs, dim=1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+        if not did_probe:
+            bx = seq.detach()
+            print(f"[Probe] input var={bx.var().item():.6f}, min={bx.min().item():.3f}, max={bx.max().item():.3f}")
+            stdlog = out.detach().float().std(dim=0).cpu().numpy().tolist()
+            print(f"[Probe] logits std = {np.round(stdlog, 4)}")
+            did_probe = True
 
-    avg_loss = total_loss / len(dataloader.dataset)
-    train_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
-    return avg_loss, train_f1
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += float(loss.item()) * seq.size(0)
+        pred = out.argmax(dim=1)
+        all_p.extend(pred.detach().cpu().numpy())
+        all_y.extend(y.detach().cpu().numpy())
+
+        # 及时释放
+        del seq, y, out, pred
+
+    # === 训练集指标汇总 ===
+    avg_loss = total_loss / len(loader.dataset)
+    f1w = f1_score(all_y, all_p, average="weighted", zero_division=0)
+
+    # 动态确定出现过的标签，兼容二分类/三分类
+    label_set = sorted(set(all_y) | set(all_p))
+    cm = confusion_matrix(all_y, all_p, labels=label_set).astype(np.int64)
+    cmn = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-12)
+
+    # 逐类 F1
+    per_f1 = f1_score(all_y, all_p, labels=label_set, average=None, zero_division=0)
+
+    # 友好打印（按已出现的标签顺序映射名称）
+    name_map = {0: "Normal", 1: "Hypopnea", 2: "ObstructiveApnea"}
+    names = [name_map.get(i, str(i)) for i in label_set]
+
+    print("\n[Train] 本轮训练集混淆矩阵（行=真值 / 列=预测）")
+    print("labels:", names)
+    print(cm)
+    print("[Train] 行归一化混淆矩阵：")
+    import numpy as _np
+    print(_np.round(cmn, 2))
+    for n, f in zip(names, per_f1):
+        print(f"  {n}: F1={f:.4f}")
+
+    return avg_loss, f1w
 
 
-def eval_model(model, dataloader, criterion, device, class_names, title):
+
+
+@torch.no_grad()
+def eval_epoch(model, loader, criterion, device,
+               search_hier=True,  # 是否进行两阶段层级阈值搜索
+               tau_grid_abn=np.linspace(0.3, 0.8, 11),
+               tau_grid_cls=np.linspace(0.3, 0.8, 6)):
     model.eval()
-    total_loss, all_preds, all_labels = 0.0, [], []
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="评估"):
-            if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                seq, labels, _ = batch
-            else:
-                seq, labels = batch
+    total_loss = 0.0
+    ys, probs = [], []
+    for seq, y, _ in tqdm(loader, desc="评估(事件)"):
+        seq = seq.to(device)
+        y = y.to(device)
+        out = model(seq)  # (B,3)
+        loss = criterion(out, y)
+        total_loss += float(loss.item()) * seq.size(0)
+        p = out.softmax(dim=1)  # (B,3)
+        probs.append(p.cpu().numpy())
+        ys.append(y.cpu().numpy())
+    probs = np.concatenate(probs, axis=0)  # (N,3)
+    ys = np.concatenate(ys, axis=0)        # (N,)
 
-            seq = seq.to(device)
-            labels = labels.view(-1).to(device)
-            outputs = model(seq)
-            loss = criterion(outputs, labels)
-
-            total_loss += loss.item() * seq.size(0)
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    avg_loss = total_loss / len(dataloader.dataset)
-    # 关键改动：指定labels参数，确保F1计算包含所有类别（避免normal类被忽略）
-    val_f1 = f1_score(
-        all_labels, all_preds,
-        labels=list(range(len(class_names))),  # 强制包含0/1/2类
-        average='weighted',
-        zero_division=0
-    )
-    print_confusion_matrix(all_labels, all_preds, class_names, title)
-
-    # 关键改动：逐类计算F1时也指定labels，确保统计正确
-    print("各类别F1分数：")
-    per_class_f1 = f1_score(
-        all_labels, all_preds,
-        labels=list(range(len(class_names))),
-        average=None,
-        zero_division=0
-    )
-    for class_name, f1v in zip(class_names, per_class_f1):
-        print(f"  {class_name}: {f1v:.4f}")
-
-    print("各类别样本数：")
-    label_count = Counter(all_labels)
-    for idx, class_name in enumerate(class_names):
-        print(f"  {class_name}: {label_count.get(idx, 0)} 个样本")
-    return avg_loss, val_f1
-
-
-# -------------------------
-# 加载预训练WGAN模型
-# -------------------------
-def load_pretrained_wgan(wgan_path, device):
-    wgan = WGANGP(
-        input_dim=100,
-        img_channels=1,
-        device=device
-    )
-    if os.path.exists(wgan_path):
-        wgan.generator.load_state_dict(torch.load(wgan_path, map_location=device))
-        wgan.generator.eval()
-        print(f"成功加载预训练WGAN生成器: {wgan_path}")
+    if not search_hier:
+        abn_prob = probs[:, 1] + probs[:, 2]
+        best_f1, best_tau, best_pred = -1, 0.5, None
+        for t in tau_grid_abn:
+            pred = np.argmax(probs, axis=1).copy()
+            pred[(abn_prob < t)] = 0  # 压回 Normal
+            f1w = f1_score(ys, pred, average="weighted", zero_division=0)
+            if f1w > best_f1:
+                best_f1, best_tau, best_pred = f1w, float(t), pred
+        tau_pack = {"tau_abn": best_tau, "tau_h": None, "tau_oa": None}
     else:
-        raise FileNotFoundError(f"WGAN生成器权重文件不存在: {wgan_path}")
-    return wgan
+        # C) 两阶段层级判决：先判 Abnormal，再在 Abnormal 内用 class-specific 阈值分 Hyp/OA
+        best_f1, best_pack, best_pred = -1, None, None
+        for t_abn in tau_grid_abn:
+            # 初筛是否异常
+            abn_mask = (probs[:, 1] + probs[:, 2]) >= t_abn
+            # 默认都先置为 Normal
+            pred = np.zeros(len(ys), dtype=np.int64)
+            # 在异常子集上再决定 Hyp vs OA
+            for t_h in tau_grid_cls:
+                for t_oa in tau_grid_cls:
+                    sub_pred = pred.copy()
+                    # 在异常子集上：
+                    # 若 p_h >= t_h 且 p_h >= p_oa => Hyp；否则若 p_oa >= t_oa 且 p_oa > p_h => OA；
+                    # 否则回退到 (p_h vs p_oa) argmax
+                    ph = probs[:, 1]
+                    po = probs[:, 2]
+                    # 先给异常子集赋予 argmax(h,oa)
+                    choice = np.where(ph >= po, 1, 2)
+                    # 提升：满足各自阈值的更“自信”样本
+                    choice[(ph >= t_h) & (ph >= po) & abn_mask] = 1
+                    choice[(po >= t_oa) & (po >  ph) & abn_mask] = 2
+                    sub_pred[abn_mask] = choice[abn_mask]
 
+                    f1w = f1_score(ys, sub_pred, average="weighted", zero_division=0)
+                    if f1w > best_f1:
+                        best_f1 = f1w
+                        best_pred = sub_pred
+                        best_pack = {"tau_abn": float(t_abn), "tau_h": float(t_h), "tau_oa": float(t_oa)}
+
+        tau_pack = best_pack if best_pack is not None else {"tau_abn": 0.5, "tau_h": 0.5, "tau_oa": 0.5}
+
+    # 报告
+    cm = confusion_matrix(ys, best_pred, labels=[0, 1, 2])
+    cmn = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-12)
+    print(f"[Val] 最优阈值: {tau_pack} | F1(w)={best_f1:.4f}")
+    print("原始混淆矩阵：\n", cm)
+    print("归一化混淆矩阵：\n", np.round(cmn, 2))
+    per = f1_score(ys, best_pred, average=None, labels=[0, 1, 2], zero_division=0)
+    for i, n in enumerate(EVENT_CLASS_NAMES):
+        print(f"  {n}: F1={per[i]:.4f}")
+
+    return total_loss / len(loader.dataset), best_f1, tau_pack
 
 # -------------------------
-# 主函数
+# 单折训练
+# -------------------------
+def run_single_fold(args, train_dir, val_dir, fold_name="single"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 数据
+    ds_tr = EventSeqDataset(
+        train_dir, img_size=args.img_size, seq_len=args.seq_len,
+        train=True, debug_probe=True,
+        stride=args.stride_train, aug_spec=args.aug_spec,
+        max_windows_per_subject=None,
+        overlap_thresh=args.overlap_thresh,
+        three_class=not args.binary_abnormal
+    )
+    ds_va = EventSeqDataset(
+        val_dir, img_size=args.img_size, seq_len=args.seq_len,
+        train=False, debug_probe=True,
+        stride=args.stride_val, aug_spec=False,
+        overlap_thresh=args.overlap_thresh,
+        three_class=not args.binary_abnormal
+    )
+
+
+    # 采样权重
+    y_tr = np.array([y for _, y, _ in ds_tr])
+    cls_cnt = np.bincount(y_tr, minlength=3)
+    if any(c == 0 for c in cls_cnt):
+        raise RuntimeError(f"训练集中存在缺类：{cls_cnt.tolist()}")
+    print(f"[Train Class Count] {cls_cnt.tolist()}")
+
+    if args.use_cbl:
+        criterion = ClassBalancedLoss(samples_per_class=cls_cnt, beta=0.9999, gamma=1.5)
+        print(f"[Loss] ClassBalancedLoss(beta={args.cbl_beta}, gamma={'%.2f'%criterion.gamma})")
+    else:
+        if args.use_focal:
+            criterion = ClassBalancedLoss(samples_per_class=[1,1,1], beta=0.0, gamma=args.focal_gamma)  # 仅 focal
+            print(f"[Loss] FocalOnly(gamma={args.focal_gamma})")
+        else:
+            criterion = nn.CrossEntropyLoss()
+            print("[Loss] CrossEntropyLoss")
+
+    # 采样器（仍保留，进一步稳住批次分布）
+    w_per_cls = 1.0 / np.maximum(cls_cnt, 1)
+    w_sample = w_per_cls[y_tr]
+    sampler = WeightedRandomSampler(weights=w_sample, num_samples=len(w_sample), replacement=True)
+
+
+    dl_tr = DataLoader(
+        ds_tr, batch_size=args.batch_size, sampler=sampler, shuffle=False,
+        num_workers=2, pin_memory=torch.cuda.is_available(),
+        persistent_workers=False, prefetch_factor=2 if 2 > 0 else None
+    )
+    dl_va = DataLoader(
+        ds_va, batch_size=args.batch_size, shuffle=False,
+        num_workers=2, pin_memory=torch.cuda.is_available(),
+        persistent_workers=False, prefetch_factor=2 if 2 > 0 else None
+    )
+
+    # 模型 & 优化
+    model = OSAEnd2EndModel(img_channels=1, img_size=args.img_size, seq_len=args.seq_len, num_classes=3).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+
+    best_f1, best_tau_pack = -1.0, {"tau_abn": 0.5, "tau_h": 0.5, "tau_oa": 0.5}
+    os.makedirs(args.save_dir, exist_ok=True)
+    best_path = os.path.join(args.save_dir, f"osa_end2end_best_3cls_{fold_name}.pth")
+
+    for ep in range(1, args.epochs + 1):
+        print(f"\n[{fold_name}] Epoch {ep}/{args.epochs}\n" + "-" * 50)
+        tr_loss, tr_f1 = train_epoch(model, dl_tr, criterion, optimizer, device, probe=(ep == 1 and args.debug))
+        print(f"Train Loss: {tr_loss:.4f} | Train F1(w): {tr_f1:.4f}")
+
+        va_loss, va_f1, tau_pack = eval_epoch(model, dl_va, criterion, device,
+                                              search_hier=True,
+                                              tau_grid_abn=np.linspace(args.tau_abn_min, args.tau_abn_max, args.tau_abn_steps),
+                                              tau_grid_cls=np.linspace(args.tau_cls_min, args.tau_cls_max, args.tau_cls_steps))
+        print(f"Val   Loss: {va_loss:.4f} | Val   F1(w): {va_f1:.4f} | tau*: {tau_pack}")
+
+        scheduler.step(va_f1)
+        if va_f1 > best_f1:
+            best_f1, best_tau_pack = va_f1, tau_pack
+            torch.save({"state_dict": model.state_dict(), "best_tau_pack": best_tau_pack}, best_path)
+            print(f"[Save] {best_path} (F1: {best_f1:.4f}, tau={best_tau_pack})")
+
+    # 保存阈值 JSON
+    with open(best_path + ".tau.json", "w") as f:
+        json.dump(best_tau_pack, f, indent=2)
+    print(f"[Done] fold={fold_name} best_f1={best_f1:.4f} | save={best_path}")
+    return best_f1, best_tau_pack, best_path
+
+# -------------------------
+# 交叉验证：LOSO / KFold
+# -------------------------
+def list_subjects(data_root):
+    subs = []
+    for fn in sorted(os.listdir(data_root)):
+        if fn.endswith(".pickle"):
+            subs.append(os.path.splitext(fn)[0])
+    return subs
+
+def materialize_split(data_root, sub_ids, dst_dir):
+    """
+    为给定 subject 列表把 .pickle “软分发”到 dst_dir（用硬链接/软链接/拷贝均可。
+    这里用硬链接如果可能，失败则拷贝）
+    """
+    os.makedirs(dst_dir, exist_ok=True)
+    for sid in sub_ids:
+        src = os.path.join(data_root, f"{sid}.pickle")
+        dst = os.path.join(dst_dir, f"{sid}.pickle")
+        if os.path.exists(dst):
+            continue
+        try:
+            os.link(src, dst)  # 硬链接（同一盘）
+        except Exception:
+            import shutil
+            shutil.copy2(src, dst)
+
+def run_cv(args):
+    data_root = args.data_root
+    subs = list_subjects(data_root)
+    if len(subs) < 2:
+        raise RuntimeError(f"CV 模式至少需要 2 个受试者，但只发现 {len(subs)}")
+
+    results = []
+    anchors = [Path.cwd(), project_root()]
+    base_tmp = Path(resolve_dir(args.tmp_split_dir, anchors))
+    base_tmp.mkdir(parents=True, exist_ok=True)
+
+    if args.cv_mode.lower() == "loso":
+        for i, test_sid in enumerate(subs):
+            train_sids = [s for s in subs if s != test_sid]
+            fold_dir = base_tmp / f"fold_loso_{test_sid}"
+            tr_dir = fold_dir / "train"
+            va_dir = fold_dir / "val"
+            if tr_dir.exists():
+                import shutil
+                shutil.rmtree(tr_dir)
+            if va_dir.exists():
+                import shutil
+                shutil.rmtree(va_dir)
+            materialize_split(data_root, train_sids, str(tr_dir))
+            materialize_split(data_root, [test_sid], str(va_dir))
+
+            f1, tau_pack, path = run_single_fold(args, str(tr_dir), str(va_dir), fold_name=f"loso_{test_sid}")
+            results.append({"fold": f"loso_{test_sid}", "f1": f1, "tau": tau_pack, "ckpt": path})
+
+    elif args.cv_mode.lower() == "kfold":
+        kf = KFold(n_splits=args.k, shuffle=True, random_state=42)
+        for i, (tr_idx, va_idx) in enumerate(kf.split(subs), 1):
+            tr_sids = [subs[j] for j in tr_idx]
+            va_sids = [subs[j] for j in va_idx]
+            fold_dir = base_tmp / f"fold_k{i}"
+            tr_dir = fold_dir / "train"
+            va_dir = fold_dir / "val"
+            if tr_dir.exists():
+                import shutil
+                shutil.rmtree(tr_dir)
+            if va_dir.exists():
+                import shutil
+                shutil.rmtree(va_dir)
+            materialize_split(data_root, tr_sids, str(tr_dir))
+            materialize_split(data_root, va_sids, str(va_dir))
+
+            f1, tau_pack, path = run_single_fold(args, str(tr_dir), str(va_dir), fold_name=f"k{i}")
+            results.append({"fold": f"k{i}", "f1": f1, "tau": tau_pack, "ckpt": path})
+    else:
+        raise ValueError(f"未知 cv_mode: {args.cv_mode}")
+
+    # 汇总
+    mean_f1 = float(np.mean([r["f1"] for r in results]))
+    print("\n==== CV 汇总 ====")
+    for r in results:
+        print(f"{r['fold']:>10s} | F1={r['f1']:.4f} | tau={r['tau']} | ckpt={r['ckpt']}")
+    print(f"平均 F1: {mean_f1:.4f}")
+
+    # 存盘
+    out_json = Path(args.save_dir) / f"cv_{args.cv_mode}.summary.json"
+    with open(out_json, "w") as f:
+        json.dump({"mode": args.cv_mode, "mean_f1": mean_f1, "folds": results}, f, indent=2)
+    print(f"[Saved] {out_json}")
+
+# -------------------------
+# Main
+# -------------------------
+# -------------------------
+# Main
 # -------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="../../config.yaml")
-    parser.add_argument("--epochs", type=int, default=50, help="端到端模型训练轮次")
-    parser.add_argument("--save_path", default="models/end2end/")
-    parser.add_argument("--train_dir", default=None, help="训练数据目录（覆盖config）")
-    parser.add_argument("--val_dir", default=None, help="验证数据目录（覆盖config）")
-    parser.add_argument("--seq_len", type=int, default=10, help="时序序列长度")
-    parser.add_argument("--wgan_pretrained",
-                        default="/Users/liyuxiang/Downloads/sleep-apnea-main/src/train/models/end2end/wgan_generator.pth",
-                        help="预训练WGAN生成器路径")
-    parser.add_argument("--img_size", type=int, default=64, help="图像尺寸（需与WGAN一致）")
-    parser.add_argument("--truth_csv",
-                        default="/Users/liyuxiang/Downloads/sleep-apnea-main/data/processed/labels/night_level_ahi.csv",
-                        help="真值CSV路径")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
 
-    # 初始化路径和配置
-    os.makedirs(args.save_path, exist_ok=True)
-    config = load_config(resolve_dir(args.config, [Path.cwd(), project_root()]))
-    anchors = [Path.cwd(), project_root()]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    # 运行模式
+    ap.add_argument("--cv_mode", choices=["none", "loso", "kfold"], default="loso",
+                    help="none=按 --train_dir / --val_dir 单折；loso/kfold=按受试者做交叉验证")
+    ap.add_argument("--data_root", type=str, default="/Users/liyuxiang/Downloads/sleep-apnea-main/data/processed/all_subjects",
+                    help="LOSO 模式下所有受试者的 .pickle 根目录")
+    ap.add_argument("--k", type=int, default=5, help="KFold 折数")
+    ap.add_argument("--tmp_split_dir", type=str, default="runs/tmp_cv_splits", help="CV 中间划分输出目录")
+    ap.add_argument("--ema_alpha", type=float, default=0.6)
+    # 数据路径（单折模式）
+    ap.add_argument("--train_dir", default="/Users/liyuxiang/Downloads/sleep-apnea-main/data/processed/signals")
+    ap.add_argument("--val_dir",   default="/Users/liyuxiang/Downloads/sleep-apnea-main/data/processed/val")
 
-    # -------------------------
-    # 步骤1：加载预训练WGAN模型
-    # -------------------------
-    print("\n" + "=" * 60)
-    print("步骤1：加载预训练WGAN模型")
-    print("=" * 60)
-    wgan = load_pretrained_wgan(args.wgan_pretrained, device)
+    # 数据与模型
+    ap.add_argument("--img_size", type=int, default=64)
+    ap.add_argument("--seq_len",  type=int, default=10)
+    ap.add_argument("--stride_train", type=int, default=5)
+    ap.add_argument("--stride_val",   type=int, default=5)   # ✅ 验证步长缩短为5
+    ap.add_argument("--aug_spec", action="store_true", help="训练时启用 SpecAugment")
+    ap.add_argument("--epochs",   type=int, default=30)
+    ap.add_argument("--batch_size", type=int, default=16)
 
-    # -------------------------
-    # 步骤2：解析数据目录
-    # -------------------------
-    if args.train_dir:
-        raw_data_dir = resolve_dir(args.train_dir, anchors)
-        data_dirs = [raw_data_dir]
+    # 损失相关
+    ap.add_argument("--use_cbl", action="store_true", help="启用 Class-Balanced Loss")
+    ap.add_argument("--cbl_beta", type=float, default=0.9999)
+    ap.add_argument("--use_focal", action="store_true")
+    ap.add_argument("--focal_gamma", type=float, default=1.5)
+
+    # 优化器
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+    ap.add_argument("--subject_id", default=None)
+
+    # 两阶段阈值搜索范围
+    ap.add_argument("--tau_abn_min", type=float, default=0.3)
+    ap.add_argument("--tau_abn_max", type=float, default=0.8)
+    ap.add_argument("--tau_abn_steps", type=int, default=11)
+    ap.add_argument("--tau_cls_min", type=float, default=0.3)
+    ap.add_argument("--tau_cls_max", type=float, default=0.8)
+    ap.add_argument("--tau_cls_steps", type=int, default=6)
+
+    # 其他
+    ap.add_argument("--save_dir", default="models/end2end")
+    ap.add_argument("--debug", action="store_true")
+
+    ap.add_argument("--overlap_thresh", type=float, default=0.2, help="重叠率阈值")
+    ap.add_argument("--binary_abnormal", action="store_true", help="若指定，则窗口标签二分类(0/1)")
+
+    args = ap.parse_args()
+
+    if args.cv_mode in ["loso", "kfold"]:
+        # 交叉验证不需要 subject_id
+        run_cv(args)
     else:
-        raw_data_dir = resolve_dir(config.paths.signals_path, anchors)
-        augmented_data_dir = resolve_dir(config.paths.augmented_save_path, anchors)
-        data_dirs = [raw_data_dir]
-        if os.path.exists(augmented_data_dir) and len(os.listdir(augmented_data_dir)) > 0:
-            data_dirs.append(augmented_data_dir)
-            print(f"加载原始数据：{raw_data_dir}")
-            print(f"加载增强数据：{augmented_data_dir}")
-        else:
-            print(f"仅加载原始数据：{raw_data_dir}")
+        # 单折/单受试者场景才可能用 subject_id
+        # 如果你的逻辑要“指定某个受试者”才生效，就在这里检查：
+        # if args.subject_id is None: raise ValueError("单受试者流程需要 --subject_id")
+        run_single_fold(args, args.train_dir, args.val_dir, fold_name="single")
 
-    val_dir = resolve_dir(args.val_dir or config.paths.signals_path, anchors)
-    print(f"验证数据目录：{val_dir}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ds = SingleSubjectSeq(args.val_dir, args.subject_id, img_size=args.img_size, seq_len=args.seq_len)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # -------------------------
-    # 步骤3：构建数据集
-    # -------------------------
-    print("\n" + "=" * 60)
-    print("步骤3：构建数据集")
-    print("=" * 60)
+    ckpt = torch.load(args.event_ckpt, map_location=device, weights_only=False)
+    model = OSAEnd2EndModel(img_channels=1, img_size=args.img_size, seq_len=args.seq_len, num_classes=3).to(device)
+    sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+    model.load_state_dict(sd, strict=True);
+    model.eval()
 
+    all_p = []
+    with torch.no_grad():
+        for seq in dl:
+            seq = seq.to(device)
+            out = model(seq)
+            p = out.softmax(dim=1).cpu().numpy()
+            all_p.append(p)
+    probs = np.concatenate(all_p, axis=0)
+    if args.ema_alpha > 0:
+        probs = ema_smooth(probs, alpha=args.ema_alpha)
 
-    # 训练数据集（保持不变）
-    train_dataset = OSAEnd2EndDataset(
-        data_dirs=data_dirs,
-        seq_len=args.seq_len,
-        img_size=args.img_size,
-        train=True,
-        wgan=None,
-        augment_ratio=0
-    )
+    # 无监督分位阈值初始化 + 小范围微调
+    abn = probs[:, 1] + probs[:, 2]
+    base = float(np.quantile(abn, 0.90))  # 90分位
+    grid_abn = np.clip(np.linspace(base - 0.1, base + 0.1, 9), 0.05, 0.95)
+    grid_cls = np.linspace(0.35, 0.75, 9)
 
-    # 保存标准化参数（保持不变）
-    with open(os.path.join(args.save_path, "data_stats.pkl"), 'wb') as f:
-        pickle.dump({"mean": train_dataset.mean, "std": train_dataset.std}, f)
-    print(f"数据标准化参数已保存到: {os.path.join(args.save_path, 'data_stats.pkl')}")
+    # 简单一致性目标：让异常比例接近分位估计；内部 Hyp/OA 用概率 argmax 与阈值一致率最大
+    def score_triplet(t_abn, t_h, t_oa):
+        pred = np.zeros(len(probs), dtype=np.int64)
+        mask = abn >= t_abn
+        ph, po = probs[:, 1], probs[:, 2]
+        choice = np.where(ph >= po, 1, 2)
+        choice[(ph >= t_h) & (ph >= po) & mask] = 1
+        choice[(po >= t_oa) & (po > ph) & mask] = 2
+        pred[mask] = choice[mask]
+        # 一致性分：越稀疏越好，且内部选择稳定
+        sparsity = 1.0 - (mask.mean())  # 少触发略加分
+        stability = (choice[mask] == np.where(ph[mask] >= po[mask], 1, 2)).mean() if mask.any() else 1.0
+        return 0.4 * sparsity + 0.6 * stability, {"tau_abn": float(t_abn), "tau_h": float(t_h), "tau_oa": float(t_oa)}
 
-    # 验证数据集（保持不变）
-    val_dataset = OSAEnd2EndDataset(
-        data_dirs=[val_dir],
-        seq_len=args.seq_len,
-        img_size=args.img_size,
-        mean=train_dataset.mean,
-        std=train_dataset.std,
-        train=False,
-        wgan=None,
-        augment_ratio=0
-    )
+    best_sc, best_tau = -1, {"tau_abn": 0.5, "tau_h": 0.5, "tau_oa": 0.5}
+    for ta in grid_abn:
+        for th in grid_cls:
+            for to in grid_cls:
+                sc, tp = score_triplet(ta, th, to)
+                if sc > best_sc: best_sc, best_tau = sc, tp
 
-    # -------------------------
-    # 关键改动：给训练集加加权采样器，平衡三类样本
-    # -------------------------
-    # 计算训练集每个样本的权重（少数类样本权重高，被采样概率大）
-    train_labels = train_dataset.labels  # 从数据集获取所有标签
-
-    num_classes = len(EVENT_CLASS_NAMES)
-
-    # 训练DataLoader加入采样器（验证集不用，保持真实分布）
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=0, pin_memory=True)
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=8,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True
-    )
-
-    # -------------------------
-    # 步骤4：初始化模型并训练
-    # -------------------------
-    # -------------------------
-    # 步骤4：初始化模型并训练（修改部分）
-    # -------------------------
-    print("\n" + "=" * 60)
-    print("步骤4：端到端OSA诊断模型训练（三类分类）")
-    print("=" * 60)
-
-    # 初始化模型（保持不变）
-    model = OSAEnd2EndModel(
-        img_channels=1,
-        img_size=args.img_size,
-        seq_len=args.seq_len,
-        num_classes=len(EVENT_CLASS_NAMES)
-    ).to(device)
-
-    # 关键改动：温和的类别权重（不极端，仅中和样本不平衡）
-    class_weights = torch.tensor([1.0, 1.8, 1.5], dtype=torch.float, device=device)
-    print(f"使用温和类别权重：{class_weights.tolist()}（对应标签：{EVENT_CLASS_NAMES}）")
-    from collections import Counter
-    cnt = Counter(train_dataset.labels)
-    weights = torch.tensor([sum(cnt.values()) / cnt.get(i, 1) for i in range(3)], dtype=torch.float, device=device)
-    criterion = nn.CrossEntropyLoss(weight=weights)
-
-    # 优化器调整（保持不变）
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=1e-4,  # 慢学习率，避免震荡
-        weight_decay=5e-4
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=8, verbose=False
-    )
-    best_f1 = 0.0
-
-    # 开始训练
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-        print("-" * 50)
-
-        # 训练
-        train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device)
-        print(f"Train Loss: {train_loss:.4f} | Train F1 (weighted): {train_f1:.4f}")
-
-        # 验证
-        val_loss, val_f1 = eval_model(
-            model, val_loader, criterion, device,
-            class_names=EVENT_CLASS_NAMES,
-            title=f"Epoch {epoch + 1} 验证集"
-        )
-        print(f"Val   Loss: {val_loss:.4f} | Val   F1 (weighted): {val_f1:.4f}")
-
-        # 夜级评估
-        try:
-            _ = eval_night_level_with_truth(
-                model,
-                val_loader,
-                device,
-                truth_csv_path="/Users/liyuxiang/Downloads/sleep-apnea-main/data/processed/labels/night_level_ahi.csv",
-                epoch_seconds=30,
-                hyp_idx=1,
-                osa_idx=2,
-            )
-        except Exception as e:
-            print(f"夜级评估出错：{str(e)}")
-
-        # 学习率调度
-        scheduler.step(val_f1)
-
-        # 保存最优模型
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            save_path = os.path.join(args.save_path, "osa_end2end_best_3class.pth")
-            torch.save(model.state_dict(), save_path)
-            print(f"保存最优模型到: {save_path} (F1: {best_f1:.4f})")
-
-    # 最终评估
-    print("\n" + "=" * 60)
-    print("训练结束，最优模型最终评估")
-    print("=" * 60)
-    model.load_state_dict(torch.load(os.path.join(args.save_path, "osa_end2end_best_3class.pth"), map_location=device))
-    final_val_loss, final_val_f1 = eval_model(
-        model, val_loader, criterion, device,
-        class_names=EVENT_CLASS_NAMES,
-        title="最优模型验证集"
-    )
-    print(f"最优模型最终加权F1: {final_val_f1:.4f}")
-
-    print("\n" + "=" * 60)
-    print("端到端OSA三类诊断模型训练完成！")
-    print("=" * 60)
+    os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
+    with open(args.out_json, "w") as f:
+        json.dump(best_tau, f, indent=2)
+    print(f"[OK] saved subject-specific tau → {args.out_json} | {best_tau}")
 
 
 if __name__ == "__main__":
     main()
-
-# import os
-# import argparse
-# import pickle
-# import numpy as np
-# import torch
-# from torch import nn
-# from torch.utils.data import DataLoader, Dataset
-# from sklearn.metrics import f1_score, confusion_matrix
-# from pathlib import Path
-# from tqdm import tqdm
-#
-# # 导入模型和工具函数
-# from src.models.wgan_gp import WGANGP
-# from src.models.osa_end2end import OSAEnd2EndModel
-# from src.preprocessing.steps.config import load_config
-# from src.utils.utils import load_pickle_events, to_uint8_image
-#
-# import torch.nn.functional as F
-#
-#
-# # -------------------------
-# # 工具函数
-# # -------------------------
-# def cfg_get(cfg, path, default=None):
-#     cur = cfg
-#     for key in path.split('.'):
-#         if cur is None:
-#             return default
-#         if hasattr(cur, key):
-#             cur = getattr(cur, key)
-#             continue
-#         if isinstance(cur, dict) and key in cur:
-#             cur = cur[key]
-#             continue
-#         return default
-#     return cur
-#
-#
-# def project_root() -> Path:
-#     return Path(__file__).resolve().parents[2]
-#
-#
-# def resolve_dir(p, anchors):
-#     if p is None:
-#         return ""
-#     P = Path(p)
-#     if P.is_absolute():
-#         return str(P)
-#     for a in anchors:
-#         cand = a / P
-#         if cand.exists():
-#             return str(cand.resolve())
-#     return str((anchors[0] / P).resolve())
-#
-#
-# # -------------------------
-# # 端到端数据集定义
-# # -------------------------
-# class OSAEnd2EndDataset(Dataset):
-#     """端到端OSA诊断数据集：直接从原始事件构建时序序列（三类分类）"""
-#
-#     # 新增 data_dirs 参数（接收目录列表），移除原 data_dir 参数
-#     def __init__(self, data_dirs, seq_len=10, img_size=64, mean=None, std=None, train=True, wgan=None,
-#                  augment_ratio=0.3):
-#         self.seq_len = seq_len
-#         self.img_size = img_size  # 图像尺寸
-#         self.train = train
-#         self.wgan = wgan
-#         self.augment_ratio = augment_ratio
-#         self.mean = mean
-#         self.std = std
-#         self.label_map = {  # 三类标签映射
-#             "normal": 0,
-#             "hypopnea": 1,
-#             "obstructiveapnea": 2
-#         }
-#
-#         # 加载多个目录的数据并构建序列
-#         self.data = self._load_and_process_data(data_dirs)
-#
-#         # 计算标准化参数（仅训练集）
-#         if train and self.mean is None:
-#             self.mean, self.std = self._calculate_mean_std()
-#
-#     def _load_and_process_data(self, data_dirs):
-#         """加载多个目录的数据并生成时序序列"""
-#         subject_events = {}  # {subject_id: list of (img, label)}
-#
-#         # 遍历所有数据目录（原始数据目录 + 增强数据目录）
-#         for data_dir in data_dirs:
-#             if not os.path.exists(data_dir):
-#                 print(f"警告：目录不存在，跳过 - {data_dir}")
-#                 continue
-#
-#             for filename in os.listdir(data_dir):
-#                 if filename.endswith(".pickle"):
-#                     pickle_path = os.path.join(data_dir, filename)
-#                     events = load_pickle_events(pickle_path)  # 加载事件列表
-#                     subject_id = filename.split('.')[0]
-#
-#                     # 区分增强样本和原始样本（避免ID冲突）
-#                     if "aug_" in filename:  # 增强样本文件名含前缀
-#                         subject_id = f"aug_{subject_id}"
-#
-#                     # 提取事件特征和标签
-#                     event_list = []
-#                     for ev in events:
-#                         # 从ApneaEvent对象中提取信号和标签
-#                         img = to_uint8_image(ev.signal)
-#                         event_label = ev.label.lower()  # 统一转为小写
-#
-#                         # 检查标签是否有效
-#                         if event_label in self.label_map:
-#                             event_list.append((img, self.label_map[event_label]))
-#                         else:
-#                             print(f"警告：无效标签 '{event_label}'，跳过事件（{subject_id}）")
-#
-#                     # 保存有效事件
-#                     if event_list:
-#                         if subject_id in subject_events:
-#                             subject_events[subject_id].extend(event_list)
-#                         else:
-#                             subject_events[subject_id] = event_list
-#
-#         # 生成滑动窗口序列（与之前逻辑一致）
-#         seq_data = []
-#         for subj_id, events in subject_events.items():
-#             # 确保事件数量足够生成序列
-#             if len(events) >= self.seq_len:
-#                 for i in range(len(events) - self.seq_len + 1):
-#                     window_imgs = [img for img, _ in events[i:i + self.seq_len]]
-#                     window_label = events[i + self.seq_len - 1][1]  # 窗口标签取最后一个事件
-#                     seq_data.append((window_imgs, window_label))
-#
-#         print(f"数据集加载完成：{len(seq_data)} 条序列 (seq_len={self.seq_len})")
-#         return seq_data
-#
-#     def _calculate_mean_std(self, max_samples=5000):
-#         """
-#         在线估计 mean/std，避免把所有像素塞进内存
-#         可采样前 max_samples 个序列（或全量）做估计
-#         """
-#         count = 0
-#         mean = 0.0
-#         M2 = 0.0  # sum of squared diffs for variance (Welford)
-#         for seq, _ in self.data[:max_samples]:
-#             for img in seq:
-#                 x = img.astype(np.float32) / 255.0
-#                 n = x.size
-#                 # 批量更新
-#                 batch_mean = float(x.mean())
-#                 batch_var = float(x.var())
-#                 # 把一批看作 n 次观测合并
-#                 total = count + n
-#                 delta = batch_mean - mean
-#                 mean += delta * n / total
-#                 M2 += batch_var * n + delta * delta * count * n / total
-#                 count = total
-#         std = float(np.sqrt(M2 / max(count - 1, 1)))
-#         print(f"计算标准化参数(采样{max_samples}) - 均值: {mean:.4f}, 标准差: {std:.4f}")
-#         return mean, std
-#
-#     def __len__(self):
-#         return len(self.data)
-#
-#     def __getitem__(self, idx):
-#         seq, label = self.data[idx]
-#         seq_tensor = []
-#         for img in seq:
-#             img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # (1,H,W), uint8 -> float
-#             # 统一尺寸到 (1, img_size, img_size)
-#             if img_tensor.shape[-2:] != (self.img_size, self.img_size):
-#                 img_tensor = F.interpolate(
-#                     img_tensor.unsqueeze(0),  # (N=1,C=1,H,W)
-#                     size=(self.img_size, self.img_size),
-#                     mode="bilinear",
-#                     align_corners=False
-#                 ).squeeze(0)
-#             img_tensor = img_tensor / 255.0
-#             img_tensor = (img_tensor - self.mean) / (self.std + 1e-6)
-#             seq_tensor.append(img_tensor)
-#         seq_tensor = torch.stack(seq_tensor, dim=0)  # (seq_len, 1, img_size, img_size)
-#         return seq_tensor, torch.tensor(label, dtype=torch.long)  # 形状: (), DataLoader 会堆成 (batch,)
-#
-#
-#
-# # -------------------------
-# # 混淆矩阵输出函数
-# # -------------------------
-# def print_confusion_matrix(y_true, y_pred, class_names, title):
-#     cm = confusion_matrix(y_true, y_pred)
-#     cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-#
-#     print(f"\n{'=' * 50}")
-#     print(f"{title} - 混淆矩阵")
-#     print(f"{'=' * 50}")
-#     print("类别映射：")
-#     for idx, name in enumerate(class_names):
-#         print(f"  索引 {idx} -> {name}")
-#     print(f"\n原始混淆矩阵：")
-#     print(cm)
-#     print(f"\n归一化混淆矩阵（保留2位小数）：")
-#     print(np.round(cm_normalized, 2))
-#     print(f"{'=' * 50}\n")
-#
-#
-# # -------------------------
-# # 训练和评估函数
-# # -------------------------
-# def train_epoch(model, dataloader, criterion, optimizer, device):
-#     model.train()
-#     total_loss = 0.0
-#     all_preds = []
-#     all_labels = []
-#
-#     for seq, labels in tqdm(dataloader, desc="训练"):
-#         seq = seq.to(device)
-#         labels = labels.view(-1).to(device)  # ← 保证是 (batch,)
-#         optimizer.zero_grad()
-#         outputs = model(seq)  # (batch, num_classes)
-#         loss = criterion(outputs, labels)  # OK
-#
-#         loss.backward()
-#         optimizer.step()
-#
-#         total_loss += loss.item() * seq.size(0)
-#         preds = torch.argmax(outputs, dim=1)
-#         all_preds.extend(preds.cpu().numpy())
-#         all_labels.extend(labels.cpu().numpy())
-#
-#     avg_loss = total_loss / len(dataloader.dataset)
-#     # 三类分类的加权F1分数
-#     train_f1 = f1_score(all_labels, all_preds, average='weighted')
-#     return avg_loss, train_f1
-#
-#
-# def eval_model(model, dataloader, criterion, device, class_names, title):
-#     model.eval()
-#     total_loss = 0.0
-#     all_preds = []
-#     all_labels = []
-#
-#     with torch.no_grad():
-#         for seq, labels in tqdm(dataloader, desc="评估"):
-#             seq = seq.to(device)
-#             labels = labels.view(-1).to(device)  # ← 同样确保 (batch,)
-#             outputs = model(seq)
-#             loss = criterion(outputs, labels)
-#
-#             total_loss += loss.item() * seq.size(0)
-#             preds = torch.argmax(outputs, dim=1)
-#             all_preds.extend(preds.cpu().numpy())
-#             all_labels.extend(labels.cpu().numpy())
-#
-#     avg_loss = total_loss / len(dataloader.dataset)
-#     val_f1 = f1_score(all_labels, all_preds, average='weighted')
-#     print_confusion_matrix(all_labels, all_preds, class_names, title)
-#     # 额外输出各类别的F1分数
-#     per_class_f1 = f1_score(all_labels, all_preds, average=None)
-#     print("各类别F1分数：")
-#     for idx, (class_name, f1) in enumerate(zip(class_names, per_class_f1)):
-#         print(f"  {class_name}: {f1:.4f}")
-#     return avg_loss, val_f1
-#
-#
-# # -------------------------
-# # 加载预训练WGAN模型
-# # -------------------------
-# def load_pretrained_wgan(wgan_path, device):
-#     """
-#     加载预训练的WGAN生成器
-#     :param wgan_path: WGAN生成器权重路径
-#     :param device: 计算设备
-#     :return: wgan模型
-#     """
-#     # 初始化WGAN-GP
-#     wgan = WGANGP(
-#         input_dim=100,
-#         img_channels=1,
-#         device=device
-#     )
-#
-#     # 加载预训练权重
-#     if os.path.exists(wgan_path):
-#         wgan.generator.load_state_dict(torch.load(wgan_path, map_location=device))
-#         wgan.generator.eval()
-#         print(f"成功加载预训练WGAN生成器: {wgan_path}")
-#     else:
-#         raise FileNotFoundError(f"WGAN生成器权重文件不存在: {wgan_path}")
-#
-#     return wgan
-#
-#
-# # -------------------------
-# # 主函数
-# # -------------------------
-# def main():
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--config", default="../../config.yaml")
-#     parser.add_argument("--epochs", type=int, default=50, help="端到端模型训练轮次")
-#     parser.add_argument("--save_path", default="models/end2end/")
-#     parser.add_argument("--train_dir", default=None, help="训练数据目录（覆盖config）")
-#     parser.add_argument("--val_dir", default=None, help="验证数据目录（覆盖config）")
-#     parser.add_argument("--seq_len", type=int, default=10, help="时序序列长度")
-#     parser.add_argument("--augment_ratio", type=float, default=0.3, help="已废弃，预处理阶段已增强")
-#     parser.add_argument(
-#         "--wgan_pretrained",
-#         default="/Users/liyuxiang/Downloads/sleep-apnea-main/src/train/models/end2end/wgan_generator.pth",
-#         help="预训练WGAN生成器路径"
-#     )
-#     parser.add_argument("--img_size", type=int, default=64, help="图像尺寸（需与WGAN一致）")
-#     args = parser.parse_args()
-#
-#     # 初始化路径和配置
-#     os.makedirs(args.save_path, exist_ok=True)
-#     config = load_config(resolve_dir(args.config, [Path.cwd(), project_root()]))
-#     anchors = [Path.cwd(), project_root()]
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     print(f"使用设备: {device}")
-#
-#     # 三类分类标签映射（与config.yaml保持一致）
-#     class_names = ["normal", "Hypopnea", "ObstructiveApnea"]
-#     label_map = {name: idx for idx, name in enumerate(class_names)}
-#
-#     # -------------------------
-#     # 步骤1：加载预训练WGAN模型（仅用于验证增强逻辑，训练时不生成新数据）
-#     # -------------------------
-#     print("\n" + "=" * 60)
-#     print("步骤1：加载预训练WGAN模型")
-#     print("=" * 60)
-#     wgan = load_pretrained_wgan(args.wgan_pretrained, device)
-#
-#     # -------------------------
-#     # 步骤2：解析数据目录（原始数据+增强数据）
-#     # -------------------------
-#     # 优先使用命令行传入的目录，否则从config读取
-#     if args.train_dir:
-#         raw_data_dir = resolve_dir(args.train_dir, anchors)
-#         augmented_data_dir = ""  # 若指定train_dir，不自动加载增强数据
-#     else:
-#         raw_data_dir = resolve_dir(config.paths.signals_path, anchors)
-#         augmented_data_dir = resolve_dir(config.paths.augmented_save_path, anchors)
-#
-#     # 构建数据目录列表（原始数据+增强数据）
-#     data_dirs = [raw_data_dir]
-#     if not args.train_dir:  # 未指定train_dir时，尝试加载增强数据
-#         if os.path.exists(augmented_data_dir) and len(os.listdir(augmented_data_dir)) > 0:
-#             data_dirs.append(augmented_data_dir)
-#             print(f"加载原始数据：{raw_data_dir}")
-#             print(f"加载增强数据：{augmented_data_dir}")
-#         else:
-#             print(f"仅加载原始数据：{raw_data_dir}（增强数据目录为空或不存在）")
-#     else:
-#         print(f"使用命令行指定的训练数据目录：{raw_data_dir}")
-#
-#     # 验证集目录（单独处理，不使用增强数据，保持原始分布）
-#     val_dir = resolve_dir(args.val_dir or config.paths.signals_path, anchors)
-#     print(f"验证数据目录：{val_dir}")
-#
-#     # -------------------------
-#     # 步骤3：构建数据集（训练集含增强数据，验证集仅原始数据）
-#     # -------------------------
-#     print("\n" + "=" * 60)
-#     print("步骤3：构建数据集")
-#     print("=" * 60)
-#
-#     # 训练数据集（加载原始+增强数据，关闭实时增强）
-#     train_dataset = OSAEnd2EndDataset(
-#         data_dirs=data_dirs,  # 传入目录列表（原始+增强）
-#         seq_len=args.seq_len,
-#         img_size=args.img_size,  # 新增img_size参数
-#         train=True,
-#         wgan=None,  # 预处理已增强，训练时无需WGAN
-#         augment_ratio=0  # 关闭实时增强
-#     )
-#
-#     # 保存标准化参数（用于推理）
-#     with open(os.path.join(args.save_path, "data_stats.pkl"), 'wb') as f:
-#         pickle.dump({"mean": train_dataset.mean, "std": train_dataset.std}, f)
-#     print(f"数据标准化参数已保存到: {os.path.join(args.save_path, 'data_stats.pkl')}")
-#
-#     # 验证数据集（仅加载原始数据，保持真实分布）
-#     val_dataset = OSAEnd2EndDataset(
-#         data_dirs=[val_dir],  # 仅原始数据
-#         seq_len=args.seq_len,
-#         img_size=args.img_size,
-#         mean=train_dataset.mean,
-#         std=train_dataset.std,
-#         train=False,
-#         wgan=None,
-#         augment_ratio=0
-#     )
-#
-#     # 数据加载器（减小batch_size避免内存溢出）
-#     train_loader = DataLoader(
-#         train_dataset,
-#         batch_size=8,  # 小批次更稳定
-#         shuffle=True,
-#         num_workers=0,
-#         pin_memory=True  # 加速GPU传输
-#     )
-#     val_loader = DataLoader(
-#         val_dataset,
-#         batch_size=8,
-#         shuffle=False,
-#         num_workers=0,
-#         pin_memory=True
-#     )
-#
-#     # -------------------------
-#     # 步骤4：初始化模型并训练
-#     # -------------------------
-#     print("\n" + "=" * 60)
-#     print("步骤4：端到端OSA诊断模型训练（三类分类）")
-#     print("=" * 60)
-#
-#     # 初始化三类分类模型
-#     model = OSAEnd2EndModel(
-#         img_channels=1,
-#         img_size=args.img_size,
-#         seq_len=args.seq_len,
-#         num_classes=3  # 三类分类
-#     ).to(device)
-#
-#     # 训练配置（针对类别不平衡，可添加权重）
-#     # 计算类别权重（可选，根据原始数据分布）
-#     train_labels = [label for _, label in train_dataset.data]
-#     class_counts = [train_labels.count(i) for i in range(3)]
-#     weights = torch.FloatTensor([sum(class_counts)/c for c in class_counts]).to(device)
-#     criterion = nn.CrossEntropyLoss(weight=weights)  # 加权损失缓解不平衡
-#
-#     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-4)
-#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#         optimizer, mode='max', factor=0.5, patience=5, verbose=True
-#     )
-#     best_f1 = 0.0
-#
-#     # 开始训练
-#     for epoch in range(args.epochs):
-#         print(f"\nEpoch {epoch + 1}/{args.epochs}")
-#         print("-" * 50)
-#
-#         # 训练
-#         train_loss, train_f1 = train_epoch(model, train_loader, criterion, optimizer, device)
-#         print(f"Train Loss: {train_loss:.4f} | Train F1 (weighted): {train_f1:.4f}")
-#
-#         # 验证
-#         val_loss, val_f1 = eval_model(
-#             model, val_loader, criterion, device,
-#             class_names=class_names,
-#             title=f"Epoch {epoch + 1} 验证集"
-#         )
-#         print(f"Val   Loss: {val_loss:.4f} | Val   F1 (weighted): {val_f1:.4f}")
-#
-#         # 学习率调度
-#         scheduler.step(val_f1)
-#
-#         # 保存最优模型
-#         if val_f1 > best_f1:
-#             best_f1 = val_f1
-#             save_path = os.path.join(args.save_path, "osa_end2end_best_3class.pth")
-#             torch.save(model.state_dict(), save_path)
-#             print(f"保存最优模型到: {save_path} (F1: {best_f1:.4f})")
-#
-#     # 最终评估
-#     print("\n" + "=" * 60)
-#     print("训练结束，最优模型最终评估")
-#     print("=" * 60)
-#     model.load_state_dict(torch.load(os.path.join(args.save_path, "osa_end2end_best_3class.pth"), weights_only=True))
-#     final_val_loss, final_val_f1 = eval_model(
-#         model, val_loader, criterion, device,
-#         class_names=class_names,
-#         title="最优模型验证集"
-#     )
-#     print(f"最优模型最终加权F1: {final_val_f1:.4f}")
-#
-#     print("\n" + "=" * 60)
-#     print("端到端OSA三类诊断模型训练完成！")
-#     print("=" * 60)
-#
-#
-#
-# if __name__ == "__main__":
-#     main()

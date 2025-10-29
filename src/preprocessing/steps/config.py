@@ -30,16 +30,6 @@ class AudioConfig(BaseModel):
     new_sample_rate: int = None
     image_size: int
 
-# 在 existing imports 下方添加
-class TrainingConfig(BaseModel):
-    batch_size: int = 32  # 默认批量大小
-    num_epochs: int = 20  # 训练轮数
-    learning_rate: float = 0.001  # 学习率
-    dropout: float = 0.3  # dropout比例
-    num_classes: int = 2  # 分类数量（默认2类：无呼吸暂停/阻塞性呼吸暂停）
-    val_split: float = 0.2  # 验证集比例
-    test_split: float = 0.1  # 测试集比例
-
 
 class PathsConfig(BaseModel):
     root: str = 'data'
@@ -54,7 +44,6 @@ class PathsConfig(BaseModel):
     spectrogram_path: str = Field(default=None)
     signals_path: str = Field(default=None)
     retired_path: str = Field(default=None)
-    augmented_save_path: str = Field(default=None)
 
     def _set_paths(self):
         base_path = Path(self.root)
@@ -68,7 +57,6 @@ class PathsConfig(BaseModel):
         self.spectrogram_path = os.path.join(base_path, 'processed', 'spectrogram')
         self.signals_path = os.path.join(base_path, 'processed', 'signals')
         self.retired_path = os.path.join(base_path, 'retired')
-        self.augmented_save_path = os.path.join(base_path, 'processed', 'augmented_signals')
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -82,7 +70,6 @@ class Config(BaseModel):
     download: DownloadConfig
     audio: AudioConfig
     paths: PathsConfig
-    training: TrainingConfig  # 新增训练配置
 
 def load_config(config_file:str) -> Config:
     with open(config_file, 'r') as file:

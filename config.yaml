@@ -7,9 +7,12 @@ steps:
 
 data:
   ids:
-    - "00000995"
-    - "00000999"
-    - "00001000"
+#    - "00000995"
+#    - "00000999"
+#    - "00001000"
+#    - "00001008"
+#    - "00001245"
+    - "00001367"
   targets:
     - "Hypopnea"
     - "ObstructiveApnea"
@@ -19,15 +22,14 @@ download:
   mode: "local" #local or gcs
   bucket_name: null
   edf_urls:
-    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1dc&path=/V3/APNEA_EDF/00001008-100507/00001008-100507[001].edf&fileName=00001008-100507%5B001%5D.edf"
-    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1da&path=/V3/APNEA_EDF/00001008-100507/00001008-100507[003].edf&fileName=00001008-100507%5B003%5D.edf"
-    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1d8&path=/V3/APNEA_EDF/00001008-100507/00001008-100507[005].edf&fileName=00001008-100507%5B005%5D.edf"
-    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1d9&path=/V3/APNEA_EDF/00001008-100507/00001008-100507[004].edf&fileName=00001008-100507%5B004%5D.edf"
-    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1db&path=/V3/APNEA_EDF/00001008-100507/00001008-100507[002].edf&fileName=00001008-100507%5B002%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1ce&path=/V3/APNEA_EDF/00001014-100507/00001014-100507[001].edf&fileName=00001014-100507%5B001%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1cd&path=/V3/APNEA_EDF/00001014-100507/00001014-100507[002].edf&fileName=00001014-100507%5B002%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1cc&path=/V3/APNEA_EDF/00001014-100507/00001014-100507[003].edf&fileName=00001014-100507%5B003%5D.edf"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842cf1cb&path=/V3/APNEA_EDF/00001014-100507/00001014-100507[004].edf&fileName=00001014-100507%5B004%5D.edf"
 
 
   rml_urls:
-    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842ceeb9&path=/V3/APNEA_RML/00001008-100507.rml&fileName=00001008-100507.rml"
+    - "https://download.scidb.cn/download?fileId=61a0ca3f89f14b48842ceec4&path=/V3/APNEA_RML/00001014-100507.rml&fileName=00001014-100507.rml"
   catalog_file: "file_catalog.txt"  # 保持不变
 
 audio:
@@ -38,9 +40,12 @@ audio:
   clip_overlap: 15
   n_mels: 128
   ids_to_process:
-    - "0000995"
-    - "0000999"
-    - "00001000"
+#    - "00000995"
+#    - "00000999"
+#    - "00001000"
+#    - "00001008"
+#    - "00001245"
+    - "00001367"
   image_size: 224
 
 training:
@@ -70,9 +75,9 @@ data_augmentation:
   balance_baseline: 0  # 平衡基准类别（0=normal，以该类样本数为目标）
   augment_method: "wgan"  # 增强方法（wgan/traditional）
   wgan_batch_size: 32  # WGAN生成批次大小
-
-# 标签映射（统一管理类别与索引对应关系）
-label_mapping:
-  normal: 0
-  Hypopnea: 1
-  ObstructiveApnea: 2
+#
+## 标签映射（统一管理类别与索引对应关系）
+#label_mapping:
+#  normal: 0
+#  Hypopnea: 1
+#  ObstructiveApnea: 2

@@ -71,7 +71,16 @@ class Processor:
 
     @staticmethod
     def _transform_signal_into_image(signal_data:np.ndarray, size:tuple) -> np.ndarray:
-        img_original = Image.fromarray(signal_data.astype(np.uint8))
+        signal_min = np.min(signal_data)
+        signal_max = np.max(signal_data)
+        # 防止除以0（如果信号全0，直接返回0矩阵）
+        if signal_max - signal_min < 1e-6:
+            normalized = np.zeros_like(signal_data)
+        else:
+            normalized = (signal_data - signal_min) / (signal_max - signal_min) * 255  # 归一化到0~255
+
+        # 关键修复2：转为uint8（此时数值在0~255，有效）
+        img_original = Image.fromarray(normalized.astype(np.uint8))
         img_resized = transforms.Resize(size)(img_original)
         return np.array(img_resized)
 
@@ -89,6 +98,7 @@ class Processor:
             n_mels=self.config.audio.n_mels
         )
         mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
+
         return mel_spectrogram
 
     def _check_folder_contains_files(self) -> int:

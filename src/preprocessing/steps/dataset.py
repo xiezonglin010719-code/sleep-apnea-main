@@ -12,11 +12,6 @@ class SignalDataset(Dataset):
         self.mean = mean
         self.std = std
 
-        if self.mean is not None and self.std is not None:
-            self.normalize = transforms.Normalize(mean=self.mean, std=self.std)
-        else:
-            self.normalize = transforms.Lambda(lambda x: x)  # 不做标准化
-
     def __len__(self):
         return len(self.dataset)
 

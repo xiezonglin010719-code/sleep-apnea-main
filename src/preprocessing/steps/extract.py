@@ -106,6 +106,13 @@ class Extractor:
         edf_folder_path = os.path.join(self.config.paths.edf_preprocess_path, edf_folder)
         edf_readout = self._read_out_single_edf_file(edf_folder_path)
 
+        # 新增：打印原始信号的统计信息（验证信号是否有效）
+        print(
+            f"原始信号统计 - 均值：{np.mean(edf_readout):.6f}，标准差：{np.std(edf_readout):.6f}，最大值：{np.max(edf_readout):.6f}")
+        if np.mean(edf_readout) == 0 and np.std(edf_readout) == 0:
+            print("⚠️  警告：原始音频信号全为0！EDF文件读取或通道选择错误！")
+
+
         for apnea_event in self.label_dictionary[edf_folder]['events']:
             start_idx = int(apnea_event['start'] * sample_rate)
             end_idx = int(apnea_event['end'] * sample_rate)
